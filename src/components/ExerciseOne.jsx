@@ -9,10 +9,80 @@ import {
   MOTOR_GND,
   MOTOR_STRIP,
   LAYOUT,
+  buildCanvasContext,
 } from "../cadModel.js";
+import ChatPanel from "./ChatPanel.jsx";
 
 function isAllowedConnection(aId, bId) {
   return aId !== bId;
+}
+
+// ── Orthogonal (Manhattan-style) wire routing ─────────────────────────────
+// Each terminal exits perpendicular to its strip/pole (top screws go up,
+// bottom screws go down), then the wire turns with right-angle bends only —
+// same convention as KiCad/Wokwi schematic routing.
+
+const STUB = 16; // distance a wire travels straight out from a terminal before it can turn
+const LANE_GAP = 9; // vertical spacing between parallel wires sharing a travel corridor
+
+function exitDir(node) {
+  const end = node?.meta?.end;
+  if (end === "top") return -1; // exits upward
+  if (end === "bot") return 1; // exits downward
+  return 1;
+}
+
+/** Move `from` toward `target` by up to `stub`, but never past it — so the
+ * stub always lands between the terminal and the travel line, never
+ * overshoots and has to double back. */
+function clampedStub(from, dir, target, stub) {
+  const reach = from + dir * stub;
+  return dir > 0 ? Math.min(reach, target) : Math.max(reach, target);
+}
+
+/** Build an orthogonal path string between two terminals. `midY`, when
+ * given, is the shared horizontal travel line this wire should use (so a
+ * whole group of parallel wires can be assigned distinct, non-overlapping
+ * lines by the caller); otherwise it's derived from the two stub ends. */
+function orthoPath(a, b, midY) {
+  const dirA = exitDir(a);
+  const dirB = exitDir(b);
+
+  const ax1 = a.x;
+  const bx1 = b.x;
+  const fallbackMidY = (a.y + dirA * STUB + b.y + dirB * STUB) / 2;
+  const travelY = midY ?? fallbackMidY;
+
+  const ay1 = clampedStub(a.y, dirA, travelY, STUB);
+  const by1 = clampedStub(b.y, dirB, travelY, STUB);
+
+  const pts = [
+    [a.x, a.y],
+    [ax1, ay1],
+    [ax1, travelY],
+    [bx1, travelY],
+    [bx1, by1],
+    [b.x, b.y],
+  ];
+
+  // Drop redundant points (zero-length segments) e.g. when ax1 === bx1.
+  const cleaned = pts.filter((p, i) => {
+    if (i === 0) return true;
+    const prev = pts[i - 1];
+    return p[0] !== prev[0] || p[1] !== prev[1];
+  });
+
+  return cleaned.map((p, i) => `${i === 0 ? "M" : "L"}${p[0]},${p[1]}`).join(" ");
+}
+
+/** Render a list of {x,y} points as an SVG path, dropping zero-length segments. */
+function pointsToPath(points) {
+  const cleaned = points.filter((p, i) => {
+    if (i === 0) return true;
+    const prev = points[i - 1];
+    return p.x !== prev.x || p.y !== prev.y;
+  });
+  return cleaned.map((p, i) => `${i === 0 ? "M" : "L"}${p.x},${p.y}`).join(" ");
 }
 
 // ── Drawing helpers (geometry must match cadModel.js GEOM) ───────────────────
@@ -919,17 +989,96 @@ const HIDE_NODE_LABEL_VIEWS = new Set([
 
 export default function ExerciseOne() {
   const [connections, setConnections] = useState([]);
-  const [selected, setSelected] = useState(null);
+  // In-progress manual wire: { startId, points: [{x,y}...], axis: 'h'|'v' }
+  // `points` always starts with the start terminal's own coordinate.
+  // `axis` is the orientation the *next* segment (to the cursor, or to the
+  // next click) is constrained to.
+  const [draft, setDraft] = useState(null);
   const [hovered, setHovered] = useState(null);
   const [cursorPos, setCursorPos] = useState(null);
   const [result, setResult] = useState(null);
   const [flash, setFlash] = useState(null);
   const svgRef = useRef(null);
+  const selected = draft?.startId ?? null;
 
   const connMap = useMemo(
     () => new Map(connections.map((c) => [c.key, c])),
     [connections],
   );
+
+  // Assign each auto-routed (unpointed) connection its own non-overlapping
+  // travel line, grouped into independent "corridors" — clusters of wires
+  // whose horizontal spans overlap AND whose natural travel heights are
+  // already close (a wide gap means they run through unrelated parts of the
+  // diagram that just happen to share x-range, e.g. QF→K1 near the top vs.
+  // K1→motor much further down).
+  const midYByKey = useMemo(() => {
+    const autoConns = connections.filter((c) => !c.points);
+    const items = autoConns
+      .map(({ key, from, to }) => {
+        const a = terminalsById[from];
+        const b = terminalsById[to];
+        if (!a || !b) return null;
+        const dirA = exitDir(a);
+        const dirB = exitDir(b);
+        const naturalMidY = (a.y + dirA * STUB + b.y + dirB * STUB) / 2;
+        const lo = Math.min(a.x, b.x);
+        const hi = Math.max(a.x, b.x);
+        return { key, ax: a.x, bx: b.x, lo, hi, naturalMidY };
+      })
+      .filter(Boolean);
+
+    const CORRIDOR_BAND = LANE_GAP * 4;
+    const inSameCorridor = (p, q) =>
+      p.lo < q.hi && q.lo < p.hi && Math.abs(p.naturalMidY - q.naturalMidY) < CORRIDOR_BAND;
+
+    // Union-find: this relation is applied transitively on purpose (unlike a
+    // plain x-overlap test, adding the y-proximity check keeps it from
+    // chaining together corridors that are actually unrelated).
+    const parent = items.map((_, i) => i);
+    const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
+    for (let i = 0; i < items.length; i++) {
+      for (let j = i + 1; j < items.length; j++) {
+        if (inSameCorridor(items[i], items[j])) {
+          const ri = find(i),
+            rj = find(j);
+          if (ri !== rj) parent[ri] = rj;
+        }
+      }
+    }
+    const clusters = new Map();
+    items.forEach((item, i) => {
+      const root = find(i);
+      if (!clusters.has(root)) clusters.set(root, []);
+      clusters.get(root).push(item);
+    });
+
+    const result = new Map();
+    clusters.forEach((cluster) => {
+      // When a corridor carries two "buses" running in opposite x-order on
+      // their two ends (e.g. K1 sits right of K2 but K1's motor leads land
+      // left of K2's), no lane assignment can avoid their wires crossing —
+      // it's geometrically forced. The best we can do is make every wire's
+      // lane track whichever endpoint has the wider spread *within this
+      // corridor*, so the crossing renders as a clean fan/X instead of an
+      // interleaved tangle.
+      const spread = (pick) => {
+        const xs = cluster.map(pick);
+        return Math.max(...xs) - Math.min(...xs);
+      };
+      const useA = spread((it) => it.ax) >= spread((it) => it.bx);
+      const sortKey = (it) => (useA ? it.ax : it.bx);
+      const ordered = [...cluster].sort((x, y) => sortKey(x) - sortKey(y));
+
+      let floor = -Infinity;
+      ordered.forEach((item) => {
+        const y = Math.max(item.naturalMidY, floor);
+        result.set(item.key, y);
+        floor = y + LANE_GAP;
+      });
+    });
+    return result;
+  }, [connections]);
 
   // Lines and peer nodes that should be highlighted when hovering a connected node
   const { hoveredLineKeys, hoveredPeerIds } = useMemo(() => {
@@ -990,40 +1139,110 @@ export default function ExerciseOne() {
 
   const onMouseMove = useCallback(
     (e) => {
-      if (!selected) {
+      if (!draft) {
         setCursorPos(null);
         return;
       }
       setCursorPos(svgXY(e));
     },
-    [selected],
+    [draft],
   );
+
+  // Constrain a free point onto the axis the next segment must travel:
+  // 'h' locks y to the last confirmed point (horizontal run),
+  // 'v' locks x to the last confirmed point (vertical run),
+  // null/'free' (only the very first segment) follows whichever axis the
+  // cursor has moved further along, decided live until the user clicks.
+  function resolveAxis(last, raw, axis) {
+    if (axis === "h" || axis === "v") return axis;
+    const dx = Math.abs(raw.x - last.x);
+    const dy = Math.abs(raw.y - last.y);
+    return dx >= dy ? "h" : "v";
+  }
+
+  function snapToAxis(last, raw, axis) {
+    const resolved = resolveAxis(last, raw, axis);
+    return resolved === "h" ? { x: raw.x, y: last.y } : { x: last.x, y: raw.y };
+  }
+
+  function flip(axis) {
+    return axis === "h" ? "v" : "h";
+  }
+
+  function cancelDraft() {
+    setDraft(null);
+    setCursorPos(null);
+  }
+
+  // Complete a draft's point list when the user clicks a terminal to finish:
+  // bend onto the terminal on the current axis, then run the final leg in
+  // (perpendicular) — same two-step elbow used for a manual waypoint, just
+  // collapsed to the terminal in one click.
+  function finishPoints(d, target) {
+    const last = d.points[d.points.length - 1];
+    const bend = snapToAxis(last, target, d.axis);
+    if (bend.x === target.x && bend.y === target.y) {
+      return [...d.points, target];
+    }
+    return [...d.points, bend, target];
+  }
 
   function onNodeClick(e, id) {
     e.stopPropagation();
     if (result?.allCorrect) return;
-    if (!selected) {
-      setSelected(id);
+    const node = terminalsById[id];
+    if (!node) return;
+
+    if (!draft) {
+      setDraft({ startId: id, points: [{ x: node.x, y: node.y }], axis: null });
       return;
     }
-    if (selected === id) {
-      setSelected(null);
+    if (draft.startId === id) {
+      cancelDraft();
       return;
     }
-    if (!isAllowedConnection(selected, id)) {
+    if (!isAllowedConnection(draft.startId, id)) {
       setFlash("Pick two different terminals.");
-      setSelected(null);
+      cancelDraft();
       setTimeout(() => setFlash(null), 2000);
       return;
     }
-    const key = connKey(selected, id);
+    const key = connKey(draft.startId, id);
+    const points = finishPoints(draft, { x: node.x, y: node.y });
     if (connMap.has(key)) {
       setConnections((prev) => prev.filter((c) => c.key !== key));
     } else {
-      setConnections((prev) => [...prev, { key, from: selected, to: id }]);
+      setConnections((prev) => [
+        ...prev,
+        { key, from: draft.startId, to: id, points },
+      ]);
     }
-    setSelected(null);
+    cancelDraft();
     if (result && !result.allCorrect) setResult(null);
+  }
+
+  // Click on empty canvas while drawing: drop a bend point, constrained to
+  // the current axis, and flip axis for the next segment.
+  function onCanvasClick(e) {
+    if (!draft) {
+      setDraft(null);
+      return;
+    }
+    const raw = svgXY(e);
+    if (!raw) return;
+    const last = draft.points[draft.points.length - 1];
+    const resolved = resolveAxis(last, raw, draft.axis);
+    const pt = snapToAxis(last, raw, resolved);
+    setDraft((d) => ({
+      ...d,
+      points: [...d.points, pt],
+      axis: flip(resolved),
+    }));
+  }
+
+  function onCanvasContextMenu(e) {
+    e.preventDefault();
+    if (draft) cancelDraft();
   }
 
   function onLineClick(e, key) {
@@ -1032,6 +1251,11 @@ export default function ExerciseOne() {
     setConnections((prev) => prev.filter((c) => c.key !== key));
     if (result && !result.allCorrect) setResult(null);
   }
+
+  const getCanvasContext = useCallback(
+    () => buildCanvasContext(connections),
+    [connections],
+  );
 
   function onSubmit() {
     const drawn = new Set(connections.map((c) => c.key));
@@ -1048,7 +1272,7 @@ export default function ExerciseOne() {
 
   function onReset() {
     setConnections([]);
-    setSelected(null);
+    setDraft(null);
     setCursorPos(null);
     setResult(null);
     setFlash(null);
@@ -1060,7 +1284,7 @@ export default function ExerciseOne() {
       return { key, from, to };
     });
     setConnections(answerConnections);
-    setSelected(null);
+    setDraft(null);
     setCursorPos(null);
     setResult(null);
   }
@@ -1087,7 +1311,8 @@ export default function ExerciseOne() {
             className="cad-svg"
             onMouseMove={onMouseMove}
             onMouseLeave={() => setCursorPos(null)}
-            onClick={() => setSelected(null)}
+            onClick={onCanvasClick}
+            onContextMenu={onCanvasContextMenu}
           >
             <defs>
               <pattern
@@ -1197,42 +1422,68 @@ export default function ExerciseOne() {
 
             <MotorBlock />
 
-            {connections.map(({ key, from, to }) => {
+            {connections.map(({ key, from, to, points }) => {
               const a = terminalsById[from];
               const b = terminalsById[to];
               if (!a || !b) return null;
               const s = lineColor(key);
+              const d = points
+                ? pointsToPath(points)
+                : orthoPath(a, b, midYByKey.get(key));
               return (
-                <line
-                  key={key}
-                  x1={a.x}
-                  y1={a.y}
-                  x2={b.x}
-                  y2={b.y}
-                  stroke={s.stroke}
-                  strokeWidth={s.sw}
-                  strokeDasharray={s.dash}
-                  strokeLinecap="round"
-                  className="conn-line"
-                  onClick={(e) => onLineClick(e, key)}
-                />
+                <g key={key}>
+                  <path
+                    d={d}
+                    fill="none"
+                    stroke="transparent"
+                    strokeWidth={10}
+                    className="conn-line-hit"
+                    onClick={(e) => onLineClick(e, key)}
+                  />
+                  <path
+                    d={d}
+                    fill="none"
+                    stroke={s.stroke}
+                    strokeWidth={s.sw}
+                    strokeDasharray={s.dash}
+                    strokeLinejoin="round"
+                    className="conn-line"
+                    pointerEvents="none"
+                  />
+                </g>
               );
             })}
 
-            {selected && cursorPos && terminalsById[selected] && (
-              <line
-                x1={terminalsById[selected].x}
-                y1={terminalsById[selected].y}
-                x2={cursorPos.x}
-                y2={cursorPos.y}
+            {draft && cursorPos && (
+              <path
+                d={pointsToPath([
+                  ...draft.points,
+                  snapToAxis(
+                    draft.points[draft.points.length - 1],
+                    cursorPos,
+                    draft.axis,
+                  ),
+                ])}
+                fill="none"
                 stroke="#ff8f00"
                 strokeWidth={1.5}
                 strokeDasharray="6,4"
-                strokeLinecap="round"
+                strokeLinejoin="round"
                 opacity={0.7}
                 pointerEvents="none"
               />
             )}
+            {draft &&
+              draft.points.map((p, i) => (
+                <circle
+                  key={i}
+                  cx={p.x}
+                  cy={p.y}
+                  r={2.5}
+                  fill="#ff8f00"
+                  pointerEvents="none"
+                />
+              ))}
 
             {terminalList.map((nd) => {
               const st = nodeState(nd.id);
@@ -1378,6 +1629,8 @@ export default function ExerciseOne() {
             </button>
           </div>
         </aside>
+
+        <ChatPanel getCanvasContext={getCanvasContext} />
       </div>
     </div>
   );

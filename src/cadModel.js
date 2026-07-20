@@ -459,6 +459,80 @@ export function buildCadModel() {
 
 export const { terminalList, terminalsById } = buildCadModel();
 
+const STRIP_TITLES = Object.fromEntries(
+  TOP_STRIPS.map((s) => [s.prefix, s.title]),
+);
+STRIP_TITLES.dist = "Distribution Block";
+STRIP_TITLES.motor = "Motor Terminal Strip";
+STRIP_TITLES["mot-gnd"] = "Motor Ground";
+
+const UNIT_TITLES = { k1: "K1", k2: "K2" };
+
+/** Human-readable label for a terminal id, e.g. "K1 pole 1 top (L2i)" or
+ * "Distribution Block cell 2 bottom (L2)". Used for chat/tutor context. */
+export function describeTerminal(id) {
+  const t = terminalsById[id];
+  if (!t) return id;
+  const m = t.meta;
+  const endWord = m.end === "top" ? "top" : m.end === "bot" ? "bottom" : m.end;
+  switch (m.kind) {
+    case "strip": {
+      const title = STRIP_TITLES[m.strip] ?? m.strip;
+      const label = m.cellLabel ? ` (${m.cellLabel})` : "";
+      return `${title} cell ${m.cell}${label}, ${endWord} screw`;
+    }
+    case "breaker":
+      return `QF (breaker) pole ${m.pole}, ${endWord} (${t.label})`;
+    case "bus":
+      return `${t.label} bus, ${endWord}`;
+    case "contactor-main": {
+      const unit = UNIT_TITLES[m.unit] ?? m.unit;
+      return `${unit} pole ${m.pole}, ${endWord} (${t.label || "screw"})`;
+    }
+    case "contactor-aux": {
+      const unit = UNIT_TITLES[m.unit] ?? m.unit;
+      return `${unit} auxiliary contact ${m.index} (${m.type}), ${endWord}`;
+    }
+    case "coil":
+      return `K relay coil, ${m.end.toUpperCase()}`;
+    case "aux-standalone":
+      return `K relay auxiliary contact (${m.type}), ${endWord}`;
+    default:
+      return id;
+  }
+}
+
+/** Build a compact, human-readable summary of the current canvas state for
+ * an LLM tutor: what's drawn, and how it compares to the answer key. */
+export function buildCanvasContext(connections) {
+  const drawnKeys = new Set(connections.map((c) => c.key));
+  const correctDrawn = [];
+  const wrongDrawn = [];
+  const missing = [];
+
+  connections.forEach(({ key, from, to }) => {
+    const line = `${describeTerminal(from)}  <->  ${describeTerminal(to)}`;
+    if (CORRECT_SET.has(key)) correctDrawn.push(line);
+    else wrongDrawn.push(line);
+  });
+
+  CORRECT_SET.forEach((key) => {
+    if (!drawnKeys.has(key)) {
+      const [from, to] = key.split("|");
+      missing.push(`${describeTerminal(from)}  <->  ${describeTerminal(to)}`);
+    }
+  });
+
+  return {
+    totalRequired: CORRECT_SET.size,
+    totalDrawn: connections.length,
+    correctDrawn,
+    wrongDrawn,
+    missing,
+    isComplete: wrongDrawn.length === 0 && missing.length === 0,
+  };
+}
+
 /** Expected connections for Submit (uses terminal ids from this model) */
 // Every node appears exactly once — no shared/hub nodes — so the diagram stays clean.
 //
