@@ -44,6 +44,7 @@ function renderMessageContent(content) {
 }
 
 export default function ChatPanel({ getCanvasContext }) {
+  const [open, setOpen] = useState(false);
   const [messages, setMessages] = useState([WELCOME]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
@@ -119,14 +120,35 @@ export default function ChatPanel({ getCanvasContext }) {
     }
   }
 
+  if (!open) {
+    return (
+      <button
+        type="button"
+        className="chat-fab"
+        onClick={() => setOpen(true)}
+        aria-label="Open Dr. CAD Bot chat"
+      >
+        🩺
+      </button>
+    );
+  }
+
   return (
     <aside className="chat-panel">
       <div className="chat-header">
         <div className="chat-avatar">🩺</div>
-        <div>
+        <div className="chat-header-text">
           <div className="chat-title">Dr. CAD Bot</div>
           <div className="chat-subtitle">Your wiring tutor</div>
         </div>
+        <button
+          type="button"
+          className="chat-close"
+          onClick={() => setOpen(false)}
+          aria-label="Close chat"
+        >
+          ✕
+        </button>
       </div>
 
       <div className="chat-messages" ref={listRef}>

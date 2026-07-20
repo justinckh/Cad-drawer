@@ -7,6 +7,7 @@
 
 html, body, #root {
   height: 100%;
+  overflow: hidden;
 }
 
 body {
@@ -19,9 +20,10 @@ body {
 
 /* ── App Shell ────────────────────────────────────────────────────────────── */
 .app {
-  min-height: 100vh;
+  height: 100vh;
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 
 .app-header {
@@ -64,20 +66,26 @@ body {
 
 .app-main {
   flex: 1;
-  padding: 20px 20px 28px;
+  min-height: 0;
+  padding: 16px 20px 20px;
   display: flex;
-  align-items: flex-start;
   justify-content: center;
+  position: relative;
 }
 
 /* ── Exercise Layout ──────────────────────────────────────────────────────── */
 .exercise {
   width: 100%;
   max-width: 1740px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 
 .exercise-title {
-  margin-bottom: 20px;
+  margin-bottom: 12px;
+  flex-shrink: 0;
 }
 
 .exercise-title h1 {
@@ -109,12 +117,13 @@ body {
 .exercise-body {
   display: flex;
   gap: 24px;
-  align-items: flex-start;
+  flex: 1;
+  min-height: 0;
 }
 
 /* ── Canvas Area ──────────────────────────────────────────────────────────── */
 .canvas-area {
-  flex: 1;
+  flex: 0 0 70%;
   min-width: 0;
   position: relative;
   background: #ffffff;
@@ -128,7 +137,8 @@ body {
   display: block;
   width: 100%;
   min-width: 860px;
-  height: auto;
+  height: 100%;
+  min-height: 500px;
   cursor: crosshair;
 }
 
@@ -214,15 +224,15 @@ body {
 
 /* ── Side Panel ───────────────────────────────────────────────────────────── */
 .side-panel {
-  width: 280px;
-  flex-shrink: 0;
+  flex: 1;
+  min-width: 240px;
   display: flex;
   flex-direction: column;
   gap: 0;
   background: #ffffff;
   border: 1px solid #d0d9e8;
   border-radius: 10px;
-  overflow: hidden;
+  overflow-y: auto;
   box-shadow: 0 2px 12px rgba(13,45,110,0.08);
 }
 
@@ -497,18 +507,45 @@ body {
   border-color: #d97706;
 }
 
-/* ── Chat Panel (Dr. CAD Bot) ─────────────────────────────────────────────── */
+/* ── Chat Panel (Dr. CAD Bot) — floating, collapsible overlay ───────────────── */
+.chat-fab {
+  position: fixed;
+  right: 28px;
+  bottom: 28px;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: #0d2d6e;
+  border: none;
+  box-shadow: 0 4px 16px rgba(13,45,110,0.35);
+  font-size: 24px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 40;
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+
+.chat-fab:hover {
+  transform: scale(1.06);
+  box-shadow: 0 6px 20px rgba(13,45,110,0.45);
+}
+
 .chat-panel {
-  width: 300px;
-  flex-shrink: 0;
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  width: 340px;
+  height: min(600px, calc(100vh - 100px));
   display: flex;
   flex-direction: column;
   background: #ffffff;
   border: 1px solid #d0d9e8;
-  border-radius: 10px;
-  box-shadow: 0 2px 12px rgba(13,45,110,0.08);
+  border-radius: 14px;
+  box-shadow: 0 12px 40px rgba(13,45,110,0.28);
   overflow: hidden;
-  height: 640px;
+  z-index: 50;
 }
 
 .chat-header {
@@ -519,6 +556,31 @@ body {
   border-bottom: 1px solid #edf0f7;
   background: #f7faff;
   flex-shrink: 0;
+}
+
+.chat-header-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.chat-close {
+  flex-shrink: 0;
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: #6b7fa3;
+  font-size: 13px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.chat-close:hover {
+  background: #e3edfa;
+  color: #0d2d6e;
 }
 
 .chat-avatar {
@@ -651,19 +713,28 @@ body {
 /* ── Responsive ───────────────────────────────────────────────────────────── */
 @media (max-width: 1180px) {
   .exercise-body {
-    flex-direction: column;
+    gap: 16px;
   }
 
-  .side-panel,
-  .chat-panel {
-    width: 100%;
-  }
-
-  .chat-panel {
-    height: 480px;
+  .side-panel {
+    min-width: 200px;
   }
 
   .app-main {
-    padding: 16px;
+    padding: 12px;
+  }
+}
+
+@media (max-width: 720px) {
+  .chat-panel {
+    right: 12px;
+    left: 12px;
+    bottom: 12px;
+    width: auto;
+  }
+
+  .chat-fab {
+    right: 16px;
+    bottom: 16px;
   }
 }
