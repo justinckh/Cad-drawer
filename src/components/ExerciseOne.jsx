@@ -1,4 +1,4 @@
-import { useState, useRef, useCallback, useMemo } from "react";
+import { useState, useRef, useCallback, useMemo, useEffect } from "react";
 import {
   connKey,
   terminalsById,
@@ -10,6 +10,7 @@ import {
   MOTOR_STRIP,
   LAYOUT,
   buildCanvasContext,
+  applyModuleOffsets,
 } from "../cadModel.js";
 import ChatPanel from "./ChatPanel.jsx";
 
@@ -24,6 +25,10 @@ function isAllowedConnection(aId, bId) {
 
 const STUB = 16; // distance a wire travels straight out from a terminal before it can turn
 const LANE_GAP = 9; // vertical spacing between parallel wires sharing a travel corridor
+const BASE_VB_W = 1100; // canvas viewBox width/height at 1:1 zoom
+const BASE_VB_H = 660;
+const MIN_ZOOM_W = 260; // most-zoomed-in viewBox width (largest zoom level)
+const MAX_ZOOM_W = BASE_VB_W * 2.2; // most-zoomed-out viewBox width
 
 function exitDir(node) {
   const end = node?.meta?.end;
@@ -85,7 +90,73 @@ function pointsToPath(points) {
   return cleaned.map((p, i) => `${i === 0 ? "M" : "L"}${p.x},${p.y}`).join(" ");
 }
 
+/** Re-anchor a manually-drawn orthogonal wire's stored points to the current
+ * (possibly dragged) terminal positions, preserving the horizontal/vertical
+ * alignment of every segment. Points are drawn with alternating H/V
+ * segments, each interior point shared between one segment fixed to the
+ * `from` side's chain and one fixed to the `to` side's chain — so only the
+ * point immediately after `from` and immediately before `to` need to slide
+ * (along their one still-fixed axis) to re-anchor the whole path; every
+ * other interior point is untouched. Verified orthogonality-preserving by
+ * randomized testing across thousands of path shapes and moves. */
+function retargetPoints(points, liveA, liveB) {
+  if (!points || points.length === 0) return points;
+  const n = points.length;
+
+  if (n === 2) {
+    // A direct two-point wire has no interior bend to preserve — insert one
+    // (same elbow finishPoints uses) so the re-anchored wire stays
+    // orthogonal even when both ends move off their shared axis.
+    if (liveA.x === liveB.x || liveA.y === liveB.y) return [liveA, liveB];
+    return [liveA, { x: liveB.x, y: liveA.y }, liveB];
+  }
+
+  const origA = points[0];
+  const origB = points[n - 1];
+  if (
+    liveA.x === origA.x && liveA.y === origA.y &&
+    liveB.x === origB.x && liveB.y === origB.y
+  ) {
+    return points;
+  }
+
+  const out = points.map((p) => ({ ...p }));
+  out[0] = { x: liveA.x, y: liveA.y };
+  out[n - 1] = { x: liveB.x, y: liveB.y };
+
+  // Segment 0 (out[0] -> out[1]) was horizontal if y matched, vertical if x
+  // matched — slide point 1 along whichever axis stays fixed.
+  if (points[0].y === points[1].y) out[1] = { x: out[1].x, y: out[0].y };
+  else out[1] = { x: out[0].x, y: out[1].y };
+
+  const last = n - 1;
+  if (points[last].y === points[last - 1].y) {
+    out[last - 1] = { x: out[last - 1].x, y: out[last].y };
+  } else {
+    out[last - 1] = { x: out[last].x, y: out[last - 1].y };
+  }
+
+  return out;
+}
+
 // ── Drawing helpers (geometry must match cadModel.js GEOM) ───────────────────
+
+/** Wraps one module's shapes in a translated, draggable group. The module's
+ * own drawing code is untouched — it still draws at its fixed base x/y — the
+ * drag offset is applied purely via the SVG transform, and terminal dots
+ * (rendered separately from `livePositions`) are kept in sync because that
+ * map applies the same offset to the terminal's base position. */
+function DraggableModule({ id, dx, dy, onPointerDown, children }) {
+  return (
+    <g
+      transform={`translate(${dx},${dy})`}
+      onPointerDown={(e) => onPointerDown(e, id)}
+      className="drag-module"
+    >
+      {children}
+    </g>
+  );
+}
 
 function TC({
   x,
@@ -998,8 +1069,56 @@ export default function ExerciseOne() {
   const [cursorPos, setCursorPos] = useState(null);
   const [result, setResult] = useState(null);
   const [flash, setFlash] = useState(null);
+  // Mobile-only: the side panel becomes a bottom sheet, collapsed by
+  // default so the canvas gets the screen. No-op on desktop (CSS ignores
+  // this class above the mobile breakpoint).
+  const [sheetOpen, setSheetOpen] = useState(false);
   const svgRef = useRef(null);
   const selected = draft?.startId ?? null;
+
+  // Draggable modules: { [moduleId]: {dx, dy} }, offset from each module's
+  // base layout position. Persists across Submit/Clear/Show Answer — only
+  // wires are affected by those actions, not where blocks have been moved.
+  const [moduleOffsets, setModuleOffsets] = useState({});
+  // Live ref mirror of moduleOffsets so the pointermove handler (added once
+  // via a stable callback) always reads the latest value without having to
+  // re-attach on every drag frame.
+  const moduleOffsetsRef = useRef(moduleOffsets);
+  moduleOffsetsRef.current = moduleOffsets;
+  const dragRef = useRef(null); // { moduleId, startSvg, startOffset, moved }
+
+  const livePositions = useMemo(
+    () => applyModuleOffsets(moduleOffsets),
+    [moduleOffsets],
+  );
+
+  // Pinch-to-zoom / pan viewBox, for touch screens where terminal targets
+  // are otherwise too small to tap precisely. Desktop mouse interaction is
+  // unaffected — this only responds to native multi-touch gestures and
+  // single-finger drags on empty canvas, both driven by raw TouchEvents
+  // (not React's pointer events, which don't expose the full touch list
+  // needed for pinch math).
+  const [viewBox, setViewBox] = useState(() => {
+    // On a narrow (mobile) screen the canvas box is portrait while the
+    // diagram is landscape (1100×660) — rather than let preserveAspectRatio
+    // letterbox the whole diagram down to a small centered rectangle, start
+    // already cropped to the busiest top-left region (control strips +
+    // QF/K1/K2) at a size matching the box's own aspect ratio, so it fills
+    // the screen edge-to-edge; pinch/pan reaches the rest. ~190px accounts
+    // for the header, title block, and collapsed bottom sheet (an estimate
+    // — only affects the very first frame, self-corrects on any gesture).
+    // Desktop keeps the full diagram in view.
+    if (typeof window !== "undefined" && window.innerWidth < 720) {
+      const boxAspect = window.innerWidth / Math.max(1, window.innerHeight - 190);
+      const w = 620;
+      const h = w / boxAspect;
+      return { x: 0, y: 0, w, h: Math.min(h, BASE_VB_H) };
+    }
+    return { x: 0, y: 0, w: BASE_VB_W, h: BASE_VB_H };
+  });
+  const viewBoxRef = useRef(viewBox);
+  viewBoxRef.current = viewBox;
+  const touchRef = useRef(null); // pinch/pan gesture in progress
 
   const connMap = useMemo(
     () => new Map(connections.map((c) => [c.key, c])),
@@ -1016,8 +1135,8 @@ export default function ExerciseOne() {
     const autoConns = connections.filter((c) => !c.points);
     const items = autoConns
       .map(({ key, from, to }) => {
-        const a = terminalsById[from];
-        const b = terminalsById[to];
+        const a = livePositions[from];
+        const b = livePositions[to];
         if (!a || !b) return null;
         const dirA = exitDir(a);
         const dirB = exitDir(b);
@@ -1078,7 +1197,7 @@ export default function ExerciseOne() {
       });
     });
     return result;
-  }, [connections]);
+  }, [connections, livePositions]);
 
   // Lines and peer nodes that should be highlighted when hovering a connected node
   const { hoveredLineKeys, hoveredPeerIds } = useMemo(() => {
@@ -1126,16 +1245,202 @@ export default function ExerciseOne() {
     return { stroke: "#f57c00", sw: 2, dash: "none" };
   }
 
-  function svgXY(e) {
+  // Convert a client-space (viewport) point to current-viewBox SVG
+  // coordinates. The SVG's default preserveAspectRatio (xMidYMid meet)
+  // uniformly scales and letterboxes rather than stretching independently
+  // on each axis — a plain per-axis ratio would silently drift from the
+  // true position whenever the rendered box's aspect ratio isn't exactly
+  // the viewBox's (i.e. almost always, since the canvas panel is fluid
+  // width and the viewBox itself now changes with zoom).
+  function clientToSvg(clientX, clientY) {
     const svg = svgRef.current;
     if (!svg) return null;
     const r = svg.getBoundingClientRect();
     const vb = svg.viewBox.baseVal;
+    const scale = Math.min(r.width / vb.width, r.height / vb.height);
+    const renderedW = vb.width * scale;
+    const renderedH = vb.height * scale;
+    const offsetX = r.left + (r.width - renderedW) / 2;
+    const offsetY = r.top + (r.height - renderedH) / 2;
     return {
-      x: ((e.clientX - r.left) / r.width) * vb.width,
-      y: ((e.clientY - r.top) / r.height) * vb.height,
+      x: vb.x + (clientX - offsetX) / scale,
+      y: vb.y + (clientY - offsetY) / scale,
     };
   }
+
+  function svgXY(e) {
+    return clientToSvg(e.clientX, e.clientY);
+  }
+
+  // Drag threshold in SVG units before a pointerdown-on-a-module counts as
+  // a drag rather than a click — lets module bodies still be clickable
+  // (e.g. clicking empty canvas inside a module's bounding box while
+  // drawing a wire) without every tiny jitter starting a move.
+  const DRAG_THRESHOLD = 3;
+
+  function onModulePointerDown(e, moduleId) {
+    // Dragging modules mid-wire-draw would relocate terminals out from
+    // under an in-progress path — disallow it, same as clicking a terminal
+    // still works normally (unaffected — this only guards module drag).
+    if (draft) return;
+    const start = svgXY(e);
+    if (!start) return;
+    const startOffset = moduleOffsetsRef.current[moduleId] ?? { dx: 0, dy: 0 };
+    dragRef.current = { moduleId, start, startOffset, moved: false };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }
+
+  function onSvgPointerMove(e) {
+    const drag = dragRef.current;
+    if (!drag) return;
+    const pos = svgXY(e);
+    if (!pos) return;
+    const dx = drag.startOffset.dx + (pos.x - drag.start.x);
+    const dy = drag.startOffset.dy + (pos.y - drag.start.y);
+    if (!drag.moved && (Math.abs(pos.x - drag.start.x) > DRAG_THRESHOLD ||
+      Math.abs(pos.y - drag.start.y) > DRAG_THRESHOLD)) {
+      drag.moved = true;
+    }
+    if (!drag.moved) return;
+    setModuleOffsets((prev) => ({ ...prev, [drag.moduleId]: { dx, dy } }));
+  }
+
+  function onSvgPointerUp(e) {
+    const drag = dragRef.current;
+    if (drag && e.currentTarget.hasPointerCapture?.(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
+    dragRef.current = null;
+  }
+
+  // Pinch-zoom / single-finger-pan for touch screens. Uses raw TouchEvents
+  // (not React's pointer events) because pinch math needs the full
+  // multi-touch list; wired via a native listener since React's touch
+  // handlers are passive by default and can't preventDefault() to stop the
+  // page from scrolling during a gesture.
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+
+    const dist = (t0, t1) =>
+      Math.hypot(t0.clientX - t1.clientX, t0.clientY - t1.clientY);
+    const mid = (t0, t1) => ({
+      clientX: (t0.clientX + t1.clientX) / 2,
+      clientY: (t0.clientY + t1.clientY) / 2,
+    });
+
+    function clampView(next) {
+      const w = Math.min(MAX_ZOOM_W, Math.max(MIN_ZOOM_W, next.w));
+      const h = w * (BASE_VB_H / BASE_VB_W);
+      // Allow panning a bit past the diagram's edge (half a screen) rather
+      // than hard-stopping exactly at the content bounds.
+      const margin = w;
+      const minX = -margin;
+      const maxX = BASE_VB_W + margin - w;
+      const minY = -margin;
+      const maxY = BASE_VB_H + margin - h;
+      return {
+        w,
+        h,
+        x: Math.min(Math.max(next.x, minX), Math.max(minX, maxX)),
+        y: Math.min(Math.max(next.y, minY), Math.max(minY, maxY)),
+      };
+    }
+
+    function onTouchStart(e) {
+      if (e.touches.length === 2) {
+        e.preventDefault();
+        const [t0, t1] = e.touches;
+        touchRef.current = {
+          mode: "pinch",
+          startDist: dist(t0, t1),
+          startMid: clientToSvg(mid(t0, t1).clientX, mid(t0, t1).clientY),
+          startView: viewBoxRef.current,
+        };
+        return;
+      }
+      if (e.touches.length === 1) {
+        const t = e.touches[0];
+        // Only start a pan if the touch didn't land on an interactive
+        // element (terminal dot or draggable module) — those handle their
+        // own gestures (tap-to-wire, drag-to-move) via pointer events.
+        const target = e.target;
+        if (target.closest(".node-g") || target.closest(".drag-module")) {
+          return;
+        }
+        touchRef.current = {
+          mode: "pan-pending",
+          startClient: { x: t.clientX, y: t.clientY },
+          startView: viewBoxRef.current,
+        };
+      }
+    }
+
+    function onTouchMove(e) {
+      const g = touchRef.current;
+      if (!g) return;
+
+      if (g.mode === "pinch" && e.touches.length === 2) {
+        e.preventDefault();
+        const [t0, t1] = e.touches;
+        const scale = g.startDist / Math.max(1, dist(t0, t1));
+        const next = clampView({
+          w: g.startView.w * scale,
+          h: g.startView.h * scale,
+          x: g.startMid.x - (g.startMid.x - g.startView.x) * scale,
+          y: g.startMid.y - (g.startMid.y - g.startView.y) * scale,
+        });
+        setViewBox(next);
+        return;
+      }
+
+      if ((g.mode === "pan-pending" || g.mode === "pan") && e.touches.length === 1) {
+        const t = e.touches[0];
+        const dxClient = t.clientX - g.startClient.x;
+        const dyClient = t.clientY - g.startClient.y;
+        if (g.mode === "pan-pending") {
+          if (Math.hypot(dxClient, dyClient) < 6) return; // still a tap
+          g.mode = "pan";
+        }
+        e.preventDefault();
+        const svgEl = svgRef.current;
+        const r = svgEl.getBoundingClientRect();
+        const view = viewBoxRef.current;
+        const scale = Math.min(r.width / view.w, r.height / view.h);
+        setViewBox((prev) =>
+          clampView({
+            ...prev,
+            x: g.startView.x - dxClient / scale,
+            y: g.startView.y - dyClient / scale,
+          }),
+        );
+      }
+    }
+
+    function onTouchEnd(e) {
+      if (e.touches.length === 0) touchRef.current = null;
+      else if (e.touches.length === 1) {
+        // Pinch ended with one finger still down — restart as a pan anchor.
+        const t = e.touches[0];
+        touchRef.current = {
+          mode: "pan-pending",
+          startClient: { x: t.clientX, y: t.clientY },
+          startView: viewBoxRef.current,
+        };
+      }
+    }
+
+    svg.addEventListener("touchstart", onTouchStart, { passive: false });
+    svg.addEventListener("touchmove", onTouchMove, { passive: false });
+    svg.addEventListener("touchend", onTouchEnd);
+    svg.addEventListener("touchcancel", onTouchEnd);
+    return () => {
+      svg.removeEventListener("touchstart", onTouchStart);
+      svg.removeEventListener("touchmove", onTouchMove);
+      svg.removeEventListener("touchend", onTouchEnd);
+      svg.removeEventListener("touchcancel", onTouchEnd);
+    };
+  }, []);
 
   const onMouseMove = useCallback(
     (e) => {
@@ -1190,7 +1495,7 @@ export default function ExerciseOne() {
   function onNodeClick(e, id) {
     e.stopPropagation();
     if (result?.allCorrect) return;
-    const node = terminalsById[id];
+    const node = livePositions[id];
     if (!node) return;
 
     if (!draft) {
@@ -1278,6 +1583,11 @@ export default function ExerciseOne() {
     setFlash(null);
   }
 
+  function onResetLayout() {
+    setModuleOffsets({});
+    onReset();
+  }
+
   function onShowAnswer() {
     const answerConnections = [...CORRECT_SET].map((key) => {
       const [from, to] = key.split("|");
@@ -1307,12 +1617,14 @@ export default function ExerciseOne() {
         <div className="canvas-area">
           <svg
             ref={svgRef}
-            viewBox="0 0 1100 660"
+            viewBox={`${viewBox.x} ${viewBox.y} ${viewBox.w} ${viewBox.h}`}
             className="cad-svg"
             onMouseMove={onMouseMove}
             onMouseLeave={() => setCursorPos(null)}
             onClick={onCanvasClick}
             onContextMenu={onCanvasContextMenu}
+            onPointerMove={onSvgPointerMove}
+            onPointerUp={onSvgPointerUp}
           >
             <defs>
               <pattern
@@ -1356,79 +1668,144 @@ export default function ExerciseOne() {
               三相(順/逆轉(F/R))電機控制電路
             </text>
 
-            {TOP_STRIPS.map((s) => (
-              <g key={s.prefix}>
-                <text
-                  x={s.titleX}
-                  y="44"
-                  textAnchor="middle"
-                  fontSize="8"
-                  fill="#555"
+            {TOP_STRIPS.map((s) => {
+              const off = moduleOffsets[s.prefix] ?? { dx: 0, dy: 0 };
+              return (
+                <DraggableModule
+                  key={s.prefix}
+                  id={s.prefix}
+                  dx={off.dx}
+                  dy={off.dy}
+                  onPointerDown={onModulePointerDown}
                 >
-                  {s.title}
-                </text>
-                {s.sub && (
                   <text
                     x={s.titleX}
-                    y="53"
+                    y="44"
                     textAnchor="middle"
-                    fontSize="7"
-                    fill="#888"
+                    fontSize="8"
+                    fill="#555"
                   >
-                    {s.sub}
+                    {s.title}
                   </text>
-                )}
-                <Strip x={s.x} y={s.y} w={s.w} h={s.h} cells={s.cells} />
-              </g>
-            ))}
+                  {s.sub && (
+                    <text
+                      x={s.titleX}
+                      y="53"
+                      textAnchor="middle"
+                      fontSize="7"
+                      fill="#888"
+                    >
+                      {s.sub}
+                    </text>
+                  )}
+                  <Strip x={s.x} y={s.y} w={s.w} h={s.h} cells={s.cells} />
+                </DraggableModule>
+              );
+            })}
 
-            <text
-              x="32"
-              y="223"
-              fontSize="8"
-              fontFamily="monospace"
-              fill="#555"
+            <DraggableModule
+              id={DIST_STRIP.prefix}
+              dx={moduleOffsets[DIST_STRIP.prefix]?.dx ?? 0}
+              dy={moduleOffsets[DIST_STRIP.prefix]?.dy ?? 0}
+              onPointerDown={onModulePointerDown}
             >
-              Distribution Block
-            </text>
-            <Strip
-              x={DIST_STRIP.x}
-              y={DIST_STRIP.y}
-              w={DIST_STRIP.w}
-              h={DIST_STRIP.h}
-              cells={DIST_STRIP.cells}
-            />
+              <text
+                x="32"
+                y="223"
+                fontSize="8"
+                fontFamily="monospace"
+                fill="#555"
+              >
+                Distribution Block
+              </text>
+              <Strip
+                x={DIST_STRIP.x}
+                y={DIST_STRIP.y}
+                w={DIST_STRIP.w}
+                h={DIST_STRIP.h}
+                cells={DIST_STRIP.cells}
+              />
+            </DraggableModule>
 
-            <Breaker3P x={LAYOUT.qf.x} y={LAYOUT.qf.y} />
-            <BusBar x={LAYOUT.busL.x} y={LAYOUT.busL.y} label="L" />
-            <BusBar x={LAYOUT.busN.x} y={LAYOUT.busN.y} label="N" />
-            <Contactor3PK2
-              x={LAYOUT.k2.x}
-              y={LAYOUT.k2.y}
-              label="K2"
-              auxMO={2}
-              auxNC={1}
-            />
-            <Contactor3P
-              x={LAYOUT.k1.x}
-              y={LAYOUT.k1.y}
-              label="K1"
-              auxMO={2}
-              auxNC={1}
-            />
-            <CoilBlock x={LAYOUT.coil.x} y={LAYOUT.coil.y} />
-            <AuxContact x={LAYOUT.krelMo.x} y={LAYOUT.krelMo.y} type="MO" />
-            <AuxContact x={LAYOUT.krelNc.x} y={LAYOUT.krelNc.y} type="NC" />
+            <DraggableModule
+              id="qf"
+              dx={moduleOffsets.qf?.dx ?? 0}
+              dy={moduleOffsets.qf?.dy ?? 0}
+              onPointerDown={onModulePointerDown}
+            >
+              <Breaker3P x={LAYOUT.qf.x} y={LAYOUT.qf.y} />
+            </DraggableModule>
+            <DraggableModule
+              id="bus-l"
+              dx={moduleOffsets["bus-l"]?.dx ?? 0}
+              dy={moduleOffsets["bus-l"]?.dy ?? 0}
+              onPointerDown={onModulePointerDown}
+            >
+              <BusBar x={LAYOUT.busL.x} y={LAYOUT.busL.y} label="L" />
+            </DraggableModule>
+            <DraggableModule
+              id="bus-n"
+              dx={moduleOffsets["bus-n"]?.dx ?? 0}
+              dy={moduleOffsets["bus-n"]?.dy ?? 0}
+              onPointerDown={onModulePointerDown}
+            >
+              <BusBar x={LAYOUT.busN.x} y={LAYOUT.busN.y} label="N" />
+            </DraggableModule>
+            <DraggableModule
+              id="k2"
+              dx={moduleOffsets.k2?.dx ?? 0}
+              dy={moduleOffsets.k2?.dy ?? 0}
+              onPointerDown={onModulePointerDown}
+            >
+              <Contactor3PK2
+                x={LAYOUT.k2.x}
+                y={LAYOUT.k2.y}
+                label="K2"
+                auxMO={2}
+                auxNC={1}
+              />
+            </DraggableModule>
+            <DraggableModule
+              id="k1"
+              dx={moduleOffsets.k1?.dx ?? 0}
+              dy={moduleOffsets.k1?.dy ?? 0}
+              onPointerDown={onModulePointerDown}
+            >
+              <Contactor3P
+                x={LAYOUT.k1.x}
+                y={LAYOUT.k1.y}
+                label="K1"
+                auxMO={2}
+                auxNC={1}
+              />
+            </DraggableModule>
+            <DraggableModule
+              id="k-coil"
+              dx={moduleOffsets["k-coil"]?.dx ?? 0}
+              dy={moduleOffsets["k-coil"]?.dy ?? 0}
+              onPointerDown={onModulePointerDown}
+            >
+              <CoilBlock x={LAYOUT.coil.x} y={LAYOUT.coil.y} />
+              <AuxContact x={LAYOUT.krelMo.x} y={LAYOUT.krelMo.y} type="MO" />
+              <AuxContact x={LAYOUT.krelNc.x} y={LAYOUT.krelNc.y} type="NC" />
+            </DraggableModule>
 
-            <MotorBlock />
+            <DraggableModule
+              id="motor"
+              dx={moduleOffsets.motor?.dx ?? 0}
+              dy={moduleOffsets.motor?.dy ?? 0}
+              onPointerDown={onModulePointerDown}
+            >
+              <MotorBlock />
+            </DraggableModule>
 
             {connections.map(({ key, from, to, points }) => {
-              const a = terminalsById[from];
-              const b = terminalsById[to];
+              const a = livePositions[from];
+              const b = livePositions[to];
               if (!a || !b) return null;
               const s = lineColor(key);
               const d = points
-                ? pointsToPath(points)
+                ? pointsToPath(retargetPoints(points, a, b))
                 : orthoPath(a, b, midYByKey.get(key));
               return (
                 <g key={key}>
@@ -1485,7 +1862,8 @@ export default function ExerciseOne() {
                 />
               ))}
 
-            {terminalList.map((nd) => {
+            {terminalList.map((base) => {
+              const nd = livePositions[base.id];
               const st = nodeState(nd.id);
               const { fill, stroke } = NODE_COLORS[st];
               const glow =
@@ -1535,7 +1913,19 @@ export default function ExerciseOne() {
           {flash && <div className="flash-msg">{flash}</div>}
         </div>
 
-        <aside className="side-panel">
+        <aside className={`side-panel ${sheetOpen ? "sheet-open" : ""}`}>
+          <button
+            type="button"
+            className="sheet-handle"
+            onClick={() => setSheetOpen((v) => !v)}
+            aria-label={sheetOpen ? "Collapse panel" : "Expand panel"}
+          >
+            <span className="sheet-handle-bar" />
+            <span className="sheet-handle-summary">
+              {drawn} / {total} connected
+            </span>
+          </button>
+
           <section className="panel-section">
             <h3 className="panel-heading">Wiring Points</h3>
             <p style={{ fontSize: 13, color: "#2d3748", lineHeight: 1.55 }}>
@@ -1613,6 +2003,13 @@ export default function ExerciseOne() {
           )}
 
           <div className="panel-actions">
+            <button
+              type="button"
+              className="btn-reset-layout"
+              onClick={onResetLayout}
+            >
+              Reset Layout
+            </button>
             <button
               type="button"
               className="btn-submit"

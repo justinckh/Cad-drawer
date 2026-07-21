@@ -172,11 +172,30 @@ function pushTerminals(list, t) {
   list.push(t);
 }
 
+/** Draggable-module registry: one entry per block the user can pick up and
+ * move. `x`/`y` are each module's base (undragged) top-left-ish anchor —
+ * the same values already used to draw it — so a drag offset of {0,0}
+ * reproduces today's fixed layout exactly. */
+export const MODULES = [
+  ...TOP_STRIPS.map((s) => ({ id: s.prefix, x: s.x, y: s.y })),
+  { id: DIST_STRIP.prefix, x: DIST_STRIP.x, y: DIST_STRIP.y },
+  { id: "qf", x: LAYOUT.qf.x, y: LAYOUT.qf.y },
+  { id: "bus-l", x: LAYOUT.busL.x, y: LAYOUT.busL.y },
+  { id: "bus-n", x: LAYOUT.busN.x, y: LAYOUT.busN.y },
+  { id: "k2", x: LAYOUT.k2.x, y: LAYOUT.k2.y },
+  { id: "k1", x: LAYOUT.k1.x, y: LAYOUT.k1.y },
+  // The coil + its two standalone aux contacts are drawn as one relay
+  // assembly ("K"), so they move together under a single module id.
+  { id: "k-coil", x: LAYOUT.coil.x, y: LAYOUT.coil.y },
+  // Motor ground symbol + motor terminal strip are one continuous unit.
+  { id: "motor", x: MOTOR_STRIP.x, y: MOTOR_STRIP.y },
+];
+
 /** Build flat terminal list + byId map from layout */
 export function buildCadModel() {
   const list = [];
 
-  const strip = (prefix, view, x, y, w, h, cells) => {
+  const strip = (prefix, view, x, y, w, h, cells, moduleId) => {
     cells.forEach((c, i) => {
       const cx = x + i * w + w / 2;
       const lab = c.label ?? "";
@@ -194,6 +213,7 @@ export function buildCadModel() {
           cell: i,
           end: "top",
           cellLabel: lab,
+          moduleId,
         },
       });
       pushTerminals(list, {
@@ -210,12 +230,13 @@ export function buildCadModel() {
           cell: i,
           end: "bot",
           cellLabel: lab,
+          moduleId,
         },
       });
     });
   };
 
-  const breaker3 = (x, y) => {
+  const breaker3 = (x, y, moduleId) => {
     const { poleW, bodyY, topScrew, botScrew } = GEOM.breaker;
     const poleY = y + bodyY;
     for (let p = 0; p < 3; p++) {
@@ -230,7 +251,7 @@ export function buildCadModel() {
         label: topL,
         lx: 0,
         ly: -12,
-        meta: { kind: "breaker", pole: p, end: "top" },
+        meta: { kind: "breaker", pole: p, end: "top", moduleId },
       });
       pushTerminals(list, {
         id: `qf-p${p}-bot`,
@@ -240,12 +261,12 @@ export function buildCadModel() {
         label: botL,
         lx: 0,
         ly: 14,
-        meta: { kind: "breaker", pole: p, end: "bot" },
+        meta: { kind: "breaker", pole: p, end: "bot", moduleId },
       });
     }
   };
 
-  const busBar = (prefix, view, x, y, letter) => {
+  const busBar = (prefix, view, x, y, letter, moduleId) => {
     const { w, h, topScrew, botScrewOff } = GEOM.bus;
     const cx = x + w / 2;
     pushTerminals(list, {
@@ -256,7 +277,7 @@ export function buildCadModel() {
       label: letter,
       lx: 0,
       ly: -12,
-      meta: { kind: "bus", end: "top" },
+      meta: { kind: "bus", end: "top", moduleId },
     });
     pushTerminals(list, {
       id: `${prefix}-bot`,
@@ -266,11 +287,11 @@ export function buildCadModel() {
       label: letter,
       lx: 0,
       ly: 14,
-      meta: { kind: "bus", end: "bot" },
+      meta: { kind: "bus", end: "bot", moduleId },
     });
   };
 
-  const contactorMain = (prefix, view, x, contY, tops, bots) => {
+  const contactorMain = (prefix, view, x, contY, tops, bots, moduleId) => {
     const PW = GEOM.contactor.poleW;
     const headerH = GEOM.contactor.headerH;
     const poleY = contY + headerH;
@@ -285,7 +306,13 @@ export function buildCadModel() {
         label: tops[p],
         lx: 0,
         ly: -12,
-        meta: { kind: "contactor-main", unit: prefix, pole: p, end: "top" },
+        meta: {
+          kind: "contactor-main",
+          unit: prefix,
+          pole: p,
+          end: "top",
+          moduleId,
+        },
       });
       pushTerminals(list, {
         id: `${prefix}-p${p}-bot`,
@@ -295,12 +322,18 @@ export function buildCadModel() {
         label: bots[p],
         lx: 0,
         ly: 14,
-        meta: { kind: "contactor-main", unit: prefix, pole: p, end: "bot" },
+        meta: {
+          kind: "contactor-main",
+          unit: prefix,
+          pole: p,
+          end: "bot",
+          moduleId,
+        },
       });
     }
   };
 
-  const contactorAux = (prefix, view, x, contY, moCount, ncCount) => {
+  const contactorAux = (prefix, view, x, contY, moCount, ncCount, moduleId) => {
     const { mainH, auxY } = GEOM.contactor;
     const ay = contY + mainH + auxY;
     const types = [...Array(moCount).fill("MO"), ...Array(ncCount).fill("NC")];
@@ -320,6 +353,7 @@ export function buildCadModel() {
           index: i,
           type,
           end: "top",
+          moduleId,
         },
       });
       pushTerminals(list, {
@@ -336,12 +370,13 @@ export function buildCadModel() {
           index: i,
           type,
           end: "bot",
+          moduleId,
         },
       });
     });
   };
 
-  const coil = (x, y) => {
+  const coil = (x, y, moduleId) => {
     const { a1x, a2x, ay } = GEOM.coil;
     pushTerminals(list, {
       id: "k-coil-a1",
@@ -351,7 +386,7 @@ export function buildCadModel() {
       label: "A1",
       lx: 0,
       ly: 14,
-      meta: { kind: "coil", end: "a1" },
+      meta: { kind: "coil", end: "a1", moduleId },
     });
     pushTerminals(list, {
       id: "k-coil-a2",
@@ -361,11 +396,11 @@ export function buildCadModel() {
       label: "A2",
       lx: 0,
       ly: 14,
-      meta: { kind: "coil", end: "a2" },
+      meta: { kind: "coil", end: "a2", moduleId },
     });
   };
 
-  const standaloneAux = (prefix, view, x, y, type) => {
+  const standaloneAux = (prefix, view, x, y, type, moduleId) => {
     const ax = x + GEOM.aux.w / 2;
     pushTerminals(list, {
       id: `${prefix}-top`,
@@ -375,7 +410,7 @@ export function buildCadModel() {
       label: "",
       lx: 0,
       ly: -10,
-      meta: { kind: "aux-standalone", type, end: "top" },
+      meta: { kind: "aux-standalone", type, end: "top", moduleId },
     });
     pushTerminals(list, {
       id: `${prefix}-bot`,
@@ -385,14 +420,14 @@ export function buildCadModel() {
       label: type,
       lx: 0,
       ly: 12,
-      meta: { kind: "aux-standalone", type, end: "bot" },
+      meta: { kind: "aux-standalone", type, end: "bot", moduleId },
     });
   };
 
   // ── Layout configs (shared with JSX drawing) ──────────────────────────────
 
   TOP_STRIPS.forEach((s) =>
-    strip(s.prefix, s.view, s.x, s.y, s.w, s.h, s.cells),
+    strip(s.prefix, s.view, s.x, s.y, s.w, s.h, s.cells, s.prefix),
   );
   strip(
     DIST_STRIP.prefix,
@@ -402,11 +437,12 @@ export function buildCadModel() {
     DIST_STRIP.w,
     DIST_STRIP.h,
     DIST_STRIP.cells,
+    DIST_STRIP.prefix,
   );
 
-  breaker3(LAYOUT.qf.x, LAYOUT.qf.y);
-  busBar("bus-l", "bus", LAYOUT.busL.x, LAYOUT.busL.y, "L");
-  busBar("bus-n", "bus", LAYOUT.busN.x, LAYOUT.busN.y, "N");
+  breaker3(LAYOUT.qf.x, LAYOUT.qf.y, "qf");
+  busBar("bus-l", "bus", LAYOUT.busL.x, LAYOUT.busL.y, "L", "bus-l");
+  busBar("bus-n", "bus", LAYOUT.busN.x, LAYOUT.busN.y, "N", "bus-n");
 
   // K2 reverse — pole labels match schematic (L3,L2,L1 on inputs)
   contactorMain(
@@ -416,8 +452,9 @@ export function buildCadModel() {
     LAYOUT.k2.y,
     ["L3", "L2", "L1"],
     ["T1", "T2", "T3"],
+    "k2",
   );
-  contactorAux("k2", "k2", LAYOUT.k2.x, LAYOUT.k2.y, 2, 1);
+  contactorAux("k2", "k2", LAYOUT.k2.x, LAYOUT.k2.y, 2, 1, "k2");
 
   contactorMain(
     "k1",
@@ -426,13 +463,28 @@ export function buildCadModel() {
     LAYOUT.k1.y,
     ["L1ᵢ", "L2ᵢ", "L3ᵢ"],
     ["T1", "T2", "T3"],
+    "k1",
   );
-  contactorAux("k1", "k1", LAYOUT.k1.x, LAYOUT.k1.y, 2, 1);
+  contactorAux("k1", "k1", LAYOUT.k1.x, LAYOUT.k1.y, 2, 1, "k1");
 
-  coil(LAYOUT.coil.x, LAYOUT.coil.y);
+  coil(LAYOUT.coil.x, LAYOUT.coil.y, "k-coil");
 
-  standaloneAux("krel-mo", "k-relay", LAYOUT.krelMo.x, LAYOUT.krelMo.y, "MO");
-  standaloneAux("krel-nc", "k-relay", LAYOUT.krelNc.x, LAYOUT.krelNc.y, "NC");
+  standaloneAux(
+    "krel-mo",
+    "k-relay",
+    LAYOUT.krelMo.x,
+    LAYOUT.krelMo.y,
+    "MO",
+    "k-coil",
+  );
+  standaloneAux(
+    "krel-nc",
+    "k-relay",
+    LAYOUT.krelNc.x,
+    LAYOUT.krelNc.y,
+    "NC",
+    "k-coil",
+  );
 
   strip(
     "mot-gnd",
@@ -442,6 +494,7 @@ export function buildCadModel() {
     MOTOR_GND.w,
     MOTOR_GND.h,
     [{ label: MOTOR_GND.label }],
+    "motor",
   );
   strip(
     MOTOR_STRIP.prefix,
@@ -451,6 +504,7 @@ export function buildCadModel() {
     MOTOR_STRIP.w,
     MOTOR_STRIP.h,
     MOTOR_STRIP.cells,
+    "motor",
   );
 
   const byId = Object.fromEntries(list.map((t) => [t.id, t]));
@@ -458,6 +512,21 @@ export function buildCadModel() {
 }
 
 export const { terminalList, terminalsById } = buildCadModel();
+
+/** Recompute every terminal's position after modules have been dragged.
+ * `moduleOffsets` is `{ [moduleId]: {dx, dy} }`; a module with no entry is
+ * treated as {dx:0, dy:0} — i.e. still at its original layout position. */
+export function applyModuleOffsets(moduleOffsets) {
+  if (!moduleOffsets || Object.keys(moduleOffsets).length === 0) {
+    return terminalsById;
+  }
+  const out = {};
+  for (const t of terminalList) {
+    const off = moduleOffsets[t.meta.moduleId];
+    out[t.id] = off ? { ...t, x: t.x + off.dx, y: t.y + off.dy } : t;
+  }
+  return out;
+}
 
 const STRIP_TITLES = Object.fromEntries(
   TOP_STRIPS.map((s) => [s.prefix, s.title]),

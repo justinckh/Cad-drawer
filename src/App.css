@@ -140,6 +140,7 @@ body {
   height: 100%;
   min-height: 500px;
   cursor: crosshair;
+  touch-action: none;
 }
 
 .cad-svg text {
@@ -175,6 +176,15 @@ body {
 
 .node-g:hover circle:last-of-type {
   r: 8;
+}
+
+.drag-module {
+  cursor: grab;
+  touch-action: none;
+}
+
+.drag-module:active {
+  cursor: grabbing;
 }
 
 .node-label {
@@ -469,6 +479,25 @@ body {
   cursor: not-allowed;
 }
 
+.btn-reset-layout {
+  width: 100%;
+  padding: 9px;
+  background: transparent;
+  color: #6b46c1;
+  border: 1px solid #b794f4;
+  border-radius: 7px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+  font-family: inherit;
+}
+
+.btn-reset-layout:hover {
+  background: #faf5ff;
+  border-color: #9f7aea;
+}
+
 .btn-reset {
   width: 100%;
   padding: 9px;
@@ -727,14 +756,155 @@ body {
 
 @media (max-width: 720px) {
   .chat-panel {
+    top: 58px;
     right: 12px;
     left: 12px;
-    bottom: 12px;
+    bottom: 76px;
     width: auto;
+    height: auto;
   }
 
   .chat-fab {
     right: 16px;
-    bottom: 16px;
+    bottom: 76px;
+  }
+}
+
+/* ── Mobile layout ────────────────────────────────────────────────────────── */
+@media (max-width: 720px) {
+  .app-header {
+    padding: 0 14px;
+    height: 46px;
+  }
+
+  .app-logo {
+    font-size: 13px;
+    gap: 7px;
+  }
+
+  .app-badge {
+    font-size: 10px;
+    padding: 2px 8px;
+  }
+
+  .app-main {
+    padding: 8px 8px 0;
+  }
+
+  .exercise-title {
+    margin-bottom: 8px;
+  }
+
+  .exercise-title h1 {
+    font-size: 16px;
+  }
+
+  .ex-badge {
+    font-size: 12px;
+    padding: 1px 7px;
+  }
+
+  .exercise-subtitle {
+    font-size: 12px;
+  }
+
+  .exercise-body {
+    flex-direction: column;
+    gap: 0;
+    position: relative;
+  }
+
+  /* Canvas fills the remaining vertical space down to the collapsed sheet.
+     The diagram itself is landscape (1100×660) but this box is portrait —
+     rather than let preserveAspectRatio letterbox the full diagram down to
+     a small centered rectangle, the initial viewBox (set in JS, matching
+     this box's own aspect ratio) starts already cropped to a busy region
+     at a size that fills the box edge-to-edge; pinch/pan reaches the rest. */
+  .canvas-area {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
+    border-radius: 10px 10px 0 0;
+  }
+
+  .cad-svg {
+    min-width: 0;
+    min-height: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  /* The side panel becomes a swipe-up bottom sheet: a collapsed handle bar
+     showing live progress by default, expanding over the canvas (not
+     pushing it) when tapped open. */
+  .side-panel {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    width: 100%;
+    min-width: 0;
+    max-height: 60px;
+    border-radius: 16px 16px 0 0;
+    box-shadow: 0 -4px 20px rgba(13,45,110,0.18);
+    transition: max-height 0.25s ease;
+    z-index: 30;
+    overflow: hidden;
+  }
+
+  .side-panel.sheet-open {
+    max-height: 72vh;
+    overflow-y: auto;
+  }
+
+  .sheet-handle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    width: 100%;
+    padding: 10px 16px 8px;
+    background: #fff;
+    border: none;
+    font-family: inherit;
+    cursor: pointer;
+    flex-shrink: 0;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+
+  .sheet-handle-bar {
+    display: none;
+  }
+
+  .sheet-handle::before {
+    content: "";
+    position: absolute;
+    top: 6px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 36px;
+    height: 4px;
+    border-radius: 3px;
+    background: #cbd5e0;
+  }
+
+  .sheet-handle-summary {
+    font-size: 13px;
+    font-weight: 600;
+    color: #0d2d6e;
+    font-family: 'JetBrains Mono', monospace;
+    margin-top: 6px;
+  }
+
+  .panel-actions {
+    padding-bottom: 20px;
+  }
+}
+
+@media (min-width: 721px) {
+  .sheet-handle {
+    display: none;
   }
 }
